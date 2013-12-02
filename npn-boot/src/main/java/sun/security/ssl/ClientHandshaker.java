@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1996, 2012, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,55 +25,28 @@
 
 package sun.security.ssl;
 
-import java.io.IOException;
+import java.io.*;
 import java.math.BigInteger;
-import java.security.AccessController;
-import java.security.GeneralSecurityException;
-import java.security.Principal;
-import java.security.PrivateKey;
-import java.security.PrivilegedActionException;
-import java.security.PrivilegedExceptionAction;
-import java.security.PublicKey;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
+import java.security.*;
+import java.util.*;
+
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.ECParameterSpec;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
-import java.util.Set;
+
+import java.security.cert.X509Certificate;
+import java.security.cert.CertificateException;
+
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
-import javax.net.ssl.SSLException;
-import javax.net.ssl.SSLHandshakeException;
-import javax.net.ssl.SSLProtocolException;
-import javax.net.ssl.X509ExtendedKeyManager;
-import javax.net.ssl.X509ExtendedTrustManager;
-import javax.net.ssl.X509TrustManager;
+
+import javax.net.ssl.*;
+
 import javax.security.auth.Subject;
 
 import org.eclipse.jetty.npn.NextProtoNego;
-import sun.net.util.IPAddressUtil;
-import sun.security.ssl.HandshakeMessage.CertificateMsg;
-import sun.security.ssl.HandshakeMessage.CertificateRequest;
-import sun.security.ssl.HandshakeMessage.CertificateVerify;
-import sun.security.ssl.HandshakeMessage.ClientHello;
-import sun.security.ssl.HandshakeMessage.DH_ServerKeyExchange;
-import sun.security.ssl.HandshakeMessage.ECDH_ServerKeyExchange;
-import sun.security.ssl.HandshakeMessage.Finished;
-import sun.security.ssl.HandshakeMessage.HelloRequest;
-import sun.security.ssl.HandshakeMessage.RSA_ServerKeyExchange;
-import sun.security.ssl.HandshakeMessage.ServerHello;
-import sun.security.ssl.HandshakeMessage.ServerHelloDone;
-
-import static sun.security.ssl.CipherSuite.KeyExchange.K_DH_ANON;
-import static sun.security.ssl.CipherSuite.KeyExchange.K_ECDH_ANON;
-import static sun.security.ssl.CipherSuite.KeyExchange.K_KRB5;
-import static sun.security.ssl.CipherSuite.KeyExchange.K_KRB5_EXPORT;
-import static sun.security.ssl.CipherSuite.KeyExchange.K_RSA;
-import static sun.security.ssl.CipherSuite.KeyExchange.K_RSA_EXPORT;
+import sun.security.ssl.HandshakeMessage.*;
+import static sun.security.ssl.CipherSuite.KeyExchange.*;
 
 /**
  * ClientHandshaker does the protocol handshaking from the point
@@ -121,6 +94,11 @@ final class ClientHandshaker extends Handshaker {
     private List<String> protocols;
     // NPN_CHANGES_END
 
+    private List<SNIServerName> requestedServerNames =
+            Collections.<SNIServerName>emptyList();
+
+    private boolean serverNamesAccepted = false;
+
     /*
      * Constructors
      */
@@ -156,6 +134,7 @@ final class ClientHandshaker extends Handshaker {
      * is processed, and writes responses as needed using the connection
      * in the constructor.
      */
+    @Override
     void processMessage(byte type, int messageLen) throws IOException {
         if (state >= type
                 && (type != HandshakeMessage.ht_hello_request)) {
@@ -536,6 +515,7 @@ final class ClientHandshaker extends Handshaker {
                     try {
                         subject = AccessController.doPrivileged(
                             new PrivilegedExceptionAction<Subject>() {
+                            @Override
                             public Subject run() throws Exception {
                                 return Krb5Helper.getClientSubject(getAccSE());
                             }});
@@ -587,10 +567,6 @@ final class ClientHandshaker extends Handshaker {
         }
 
         if (resumingSession && session != null) {
-            if (protocolVersion.v >= ProtocolVersion.TLS12.v) {
-                handshakeHash.setCertificateVerifyAlg(null);
-            }
-
             setHandshakeSessionSE(session);
             return;
         }
@@ -598,7 +574,9 @@ final class ClientHandshaker extends Handshaker {
         // check extensions
         for (HelloExtension ext : mesg.extensions.list()) {
             ExtensionType type = ext.type;
-            if ((type != ExtensionType.EXT_ELLIPTIC_CURVES)
+            if (type == ExtensionType.EXT_SERVER_NAME) {
+                serverNamesAccepted = true;
+            } else if ((type != ExtensionType.EXT_ELLIPTIC_CURVES)
                     && (type != ExtensionType.EXT_EC_POINT_FORMATS)
                     && (type != ExtensionType.EXT_SERVER_NAME)
                     // NPN_CHANGES_BEGIN
@@ -614,6 +592,7 @@ final class ClientHandshaker extends Handshaker {
         session = new SSLSessionImpl(protocolVersion, cipherSuite,
                             getLocalSupportedSignAlgs(),
                             mesg.sessionId, getHostSE(), getPortSE());
+        session.setRequestedServerNames(requestedServerNames);
         setHandshakeSessionSE(session);
         if (debug != null && Debug.isOn("handshake")) {
             System.out.println("** " + cipherSuite);
@@ -636,12 +615,14 @@ final class ClientHandshaker extends Handshaker {
             }
         }
         // NPN_CHANGES_END
+
     }
 
     /*
      * Server's own key was either a signing-only key, or was too
      * large for export rules ... this message holds an ephemeral
      * RSA key to use for key exchange.
+     *
      */
     private void serverKeyExchange(RSA_ServerKeyExchange mesg)
             throws IOException, GeneralSecurityException {
@@ -915,15 +896,47 @@ final class ClientHandshaker extends Handshaker {
             break;
         case K_KRB5:
         case K_KRB5_EXPORT:
-            String hostname = getHostSE();
-            if (hostname == null) {
-                throw new IOException("Hostname is required" +
-                                " to use Kerberos cipher suites");
+            String sniHostname = null;
+            for (SNIServerName serverName : requestedServerNames) {
+                if (serverName instanceof SNIHostName) {
+                    sniHostname = ((SNIHostName) serverName).getAsciiName();
+                    break;
+                }
             }
-            KerberosClientKeyExchange kerberosMsg =
-                new KerberosClientKeyExchange(
-                    hostname, isLoopbackSE(), getAccSE(), protocolVersion,
-                sslContext.getSecureRandom());
+
+            KerberosClientKeyExchange kerberosMsg = null;
+            if (sniHostname != null) {
+                // use first requested SNI hostname
+                try {
+                    kerberosMsg = new KerberosClientKeyExchange(
+                        sniHostname, getAccSE(), protocolVersion,
+                        sslContext.getSecureRandom());
+                } catch(IOException e) {
+                    if (serverNamesAccepted) {
+                        // server accepted requested SNI hostname,
+                        // so it must be used
+                        throw e;
+                    }
+                    // fallback to using hostname
+                    if (debug != null && Debug.isOn("handshake")) {
+                        System.out.println(
+                            "Warning, cannot use Server Name Indication: "
+                                + e.getMessage());
+                    }
+                }
+            }
+
+            if (kerberosMsg == null) {
+                String hostname = getHostSE();
+                if (hostname == null) {
+                    throw new IOException("Hostname is required" +
+                        " to use Kerberos cipher suites");
+                }
+                kerberosMsg = new KerberosClientKeyExchange(
+                     hostname, getAccSE(), protocolVersion,
+                     sslContext.getSecureRandom());
+            }
+
             // Record the principals involved in exchange
             session.setPeerPrincipal(kerberosMsg.getPeerPrincipal());
             session.setLocalPrincipal(kerberosMsg.getLocalPrincipal());
@@ -1025,8 +1038,6 @@ final class ClientHandshaker extends Handshaker {
                         throw new SSLHandshakeException(
                                 "No supported hash algorithm");
                     }
-
-                    handshakeHash.setCertificateVerifyAlg(hashAlg);
                 }
 
                 m3 = new CertificateVerify(protocolVersion, handshakeHash,
@@ -1044,10 +1055,6 @@ final class ClientHandshaker extends Handshaker {
             }
             m3.write(output);
             output.doHashes();
-        } else {
-            if (protocolVersion.v >= ProtocolVersion.TLS12.v) {
-                handshakeHash.setCertificateVerifyAlg(null);
-            }
         }
 
         /*
@@ -1155,6 +1162,7 @@ final class ClientHandshaker extends Handshaker {
     /*
      * Returns a ClientHello message to kickstart renegotiations
      */
+    @Override
     HandshakeMessage getKickstartMessage() throws SSLException {
         // session ID of the ClientHello message
         SessionId sessionId = SSLSessionImpl.nullSession.getSessionId();
@@ -1299,17 +1307,14 @@ final class ClientHandshaker extends Handshaker {
 
         // add server_name extension
         if (enableSNIExtension) {
-            // We cannot use the hostname resolved from name services.  For
-            // virtual hosting, multiple hostnames may be bound to the same IP
-            // address, so the hostname resolved from name services is not
-            // reliable.
-            String hostname = getRawHostnameSE();
+            if (session != null) {
+                requestedServerNames = session.getRequestedServerNames();
+            } else {
+                requestedServerNames = serverNames;
+            }
 
-            // we only allow FQDN
-            if (hostname != null && hostname.indexOf('.') > 0 &&
-                    !IPAddressUtil.isIPv4LiteralAddress(hostname) &&
-                    !IPAddressUtil.isIPv6LiteralAddress(hostname)) {
-                clientHelloMessage.addServerNameIndicationExtension(hostname);
+            if (!requestedServerNames.isEmpty()) {
+                clientHelloMessage.addSNIExtension(requestedServerNames);
             }
         }
 
@@ -1361,6 +1366,7 @@ final class ClientHandshaker extends Handshaker {
     /*
      * Fault detected during handshake.
      */
+    @Override
     void handshakeAlert(byte description) throws SSLProtocolException {
         String message = Alerts.alertDescription(description);
 
